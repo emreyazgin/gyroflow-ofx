@@ -8,11 +8,17 @@ use lru::LruCache;
 use ofx::*;
 use parking_lot::{ Mutex, RwLock };
 use super::fuscript::*;
+use crate::orientation::{
+    custom_output_region, frame_geometry, resolve_host_turn, stabilization_output_size,
+    HostPage, RotationOverride,
+};
 
+// Distinct from the official plugin ids (`xyz.gyroflow` and
+// `nl.smslv.gyroflowofx.fisheyestab_v1`) so this build can be installed beside them.
 plugin_module!(
-    "nl.smslv.gyroflowofx.fisheyestab_v1",
+    "xyz.gyroflow.emre",
     ApiVersion(1),
-    PluginVersion(1, 2),
+    PluginVersion(1, 3),
     GyroflowPlugin::default
 );
 
@@ -28,6 +34,44 @@ struct GyroflowPlugin {
 	host_supports_multiple_clip_depths: Bool,
     context_initialized: bool,
     log_initialized: bool
+}
+
+impl GyroflowPlugin {
+    /// Log next to Gyroflow's other files, then the temp directory, then `/tmp`.
+    ///
+    /// The old path was beside the bundle binary (`…/MacOS/GyroflowEmre.log`).
+    /// `/Library/OFX/Plugins` is not writable, and the `/tmp` fallback was
+    /// compiled out on macOS, so a Mac install produced no log at all when
+    /// Describe returned early.
+    fn init_plugin_log(&mut self) {
+        if self.log_initialized {
+            return;
+        }
+        log_panics::init();
+        let log_config = [ "mp4parse", "wgpu", "naga", "akaze", "ureq", "rustls", "ofx" ]
+            .into_iter()
+            .fold(simplelog::ConfigBuilder::new(), |mut cfg, x| { cfg.add_filter_ignore_str(x); cfg })
+            .build();
+        let name = "gyroflow-emre-ofx.log";
+        let candidates = [
+            gyroflow_core::settings::data_dir().join(name),
+            std::env::temp_dir().join(name),
+            std::path::PathBuf::from("/tmp").join(name),
+        ];
+        for path in &candidates {
+            if let Ok(file_log) = std::fs::File::create(path) {
+                if simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config.clone(), file_log).is_ok() {
+                    self.log_initialized = true;
+                    log::info!("Log file: {}", path.display());
+                    return;
+                }
+            }
+        }
+        eprintln!(
+            "gyroflow-emre: failed to create a log file at {:?}, {:?}, or {:?}",
+            candidates[0], candidates[1], candidates[2]
+        );
+    }
 }
 
 struct KeyframableParams {
@@ -102,18 +146,26 @@ struct InstanceData {
     param_dont_draw_outside: ParamHandle<Bool>,
     param_include_project_data: ParamHandle<Bool>,
     param_input_rotation: ParamHandle<Double>,
+    param_rotation_override: ParamHandle<Int>,
     gyrodata: LruCache<String, Arc<StabilizationManager>>,
 
     reload_values_from_project: bool,
 
     original_video_size: (usize, usize),
     original_output_size: (usize, usize),
+    /// Container rotation in degrees (the file's display flag), not the host turn.
+    metadata_rotation: f64,
+    metadata_rotation_known: bool,
+    resolve_page: HostPage,
     num_frames: usize,
     fps: f64,
     ever_changed: bool,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
+    /// Media path from Resolve's `OfxImageEffectPropSrcFilePath`, applied once
+    /// when the project field is still empty.
+    pending_src_path: Option<String>,
 
     opencl_disabled: bool,
 }
@@ -135,6 +187,7 @@ impl InstanceData {
         let _ = kparams.positiony.set_enabled(loaded);
         let _ = kparams.rotation.set_enabled(loaded);
         let _ = kparams.video_speed.set_enabled(loaded);
+        let _ = self.param_rotation_override.set_enabled(loaded);
         let _ = self.param_disable_stretch.set_enabled(loaded);
         let _ = self.param_toggle_overview.set_enabled(loaded);
         let _ = self.param_reload_project.set_enabled(loaded);
@@ -150,6 +203,23 @@ impl InstanceData {
             if params.use_gyroflows_cached && kf.is_keyframed_internally(typ) { return None; }
             params.cached_keyframes.value_at_video_timestamp(typ, timestamp_ms)
         });
+    }
+
+    fn rotation_override(&self) -> RotationOverride {
+        RotationOverride::from_index(self.param_rotation_override.get_value().unwrap_or(0))
+    }
+
+    fn remember_container_rotation(&mut self, stab: &StabilizationManager, direct: Option<f64>) {
+        if self.metadata_rotation_known {
+            return;
+        }
+        if let Some(rotation) = direct {
+            self.metadata_rotation = rotation;
+            self.metadata_rotation_known = true;
+            return;
+        }
+        self.metadata_rotation = container_rotation(stab);
+        self.metadata_rotation_known = true;
     }
 
     fn gyrodata(&mut self, bit_depth: BitDepth, output_rect: RectI, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
@@ -174,9 +244,16 @@ impl InstanceData {
             self.update_loaded_state(false);
             return Err(Error::UnknownError);
         }
-        let key = format!("{path}{bit_depth:?}{in_size:?}{out_size:?}{disable_stretch}{instance_id}");
+        let override_index = self.param_rotation_override.get_value().unwrap_or(0);
+        // Page and override are part of the key: Edit and Fusion size the output
+        // differently, and Vertical Video must not reuse an Auto manager.
+        let key = format!(
+            "{path}{bit_depth:?}{in_size:?}{out_size:?}{disable_stretch}{instance_id}ov{override_index}{:?}",
+            self.resolve_page
+        );
         let cloned = MANAGER_CACHE.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
+            self.remember_container_rotation(&stab, None);
             // Cache it in this instance as well
             if !self.gyrodata.contains(&key) {
                 self.gyrodata.put(key.to_owned(), stab.clone());
@@ -196,6 +273,7 @@ impl InstanceData {
                 }
             }
 
+            let mut direct_rotation = None;
             if !path.ends_with(".gyroflow") {
                 // Try to load from video file
                 // let mut metadata = None;
@@ -214,6 +292,7 @@ impl InstanceData {
 
                 match stab.load_video_file(&filesystem::path_to_url(&path), None, true) {
                     Ok(md) => {
+                        direct_rotation = Some(md.rotation as f64);
                         if let Ok(d) = self.param_embedded_lens.get_value() {
                             if !d.is_empty() {
                                 if let Err(e) = stab.load_lens_profile(&d) {
@@ -291,6 +370,8 @@ impl InstanceData {
                 })?;
             }
 
+            self.remember_container_rotation(&stab, direct_rotation);
+
             let loaded = {
                 stab.params.write().calculate_ramped_timestamps(&stab.keyframes.read(), false, true);
                 let params = stab.params.read();
@@ -366,7 +447,18 @@ impl InstanceData {
 
 
             stab.init_size();
-            stab.set_output_size(out_size.0, out_size.1);
+            let video_size = stab.params.read().size;
+            let slider = self.param_input_rotation.get_value().unwrap_or(0.0);
+            let host_turn = resolve_host_turn(
+                self.rotation_override(),
+                self.metadata_rotation,
+                slider,
+                video_size,
+                in_size,
+                self.resolve_page,
+            );
+            let stabilized_size = stabilization_output_size(video_size, host_turn.aspect, out_size, self.resolve_page);
+            stab.set_output_size(stabilized_size.0, stabilized_size.1);
 
             {
                 let mut stab = stab.stabilization.write();
@@ -410,24 +502,24 @@ impl InstanceData {
         Ok(false)
     }
 
-    fn get_center_rect(width: usize, height: usize, org_ratio: f64) -> (usize, usize, usize, usize) {
-        // If aspect ratio is different
-        let new_ratio = width as f64 / height as f64;
-        if (new_ratio - org_ratio).abs() > 0.1 {
-            // Get center rect of original aspect ratio
-            let rect = if new_ratio > org_ratio {
-                ((height as f64 * org_ratio).round() as usize, height)
-            } else {
-                (width, (width as f64 / org_ratio).round() as usize)
-            };
-            (
-                (width - rect.0) / 2, // x
-                (height - rect.1) / 2, // y
-                rect.0, // width
-                rect.1 // height
-            )
-        } else {
-            (0, 0, width, height)
+    /// Fill an empty project field from the host media path. A saved or browsed
+    /// path is kept. A sibling `.gyroflow` is used when one exists.
+    fn adopt_host_source_file(&mut self, fresh_src: Option<String>) {
+        let current = self.param_project_path.get_value().unwrap_or_default();
+        if !current.is_empty() {
+            self.pending_src_path = None;
+            return;
+        }
+        if self.pending_src_path.as_deref().unwrap_or("").is_empty() {
+            if let Some(path) = fresh_src.filter(|path| !path.is_empty()) {
+                self.pending_src_path = Some(path);
+            }
+        }
+        let Some(src) = self.pending_src_path.clone() else { return };
+        let Some(path) = project_path_from_host_source(&current, &src) else { return };
+        self.reload_values_from_project = true;
+        if self.param_project_path.set_value(path).is_ok() {
+            self.pending_src_path = None;
         }
     }
 
@@ -517,6 +609,41 @@ impl InstanceData {
     }
 }
 
+/// Container rotation flag in degrees. Prefers the file itself; a `.gyroflow`
+/// project stores the same flag in `video_rotation` when the file cannot be read.
+fn container_rotation(stab: &StabilizationManager) -> f64 {
+    {
+        let gyro = stab.gyro.read();
+        let metadata = gyro.file_metadata.read();
+        let rotation = metadata.additional_data.get("rotation").and_then(|value| {
+            value.as_f64()
+                .or_else(|| value.as_i64().map(|v| v as f64))
+                .or_else(|| value.as_u64().map(|v| v as f64))
+        });
+        if let Some(rotation) = rotation {
+            if rotation.abs() > 0.5 {
+                return rotation;
+            }
+        }
+    }
+    let url = stab.input_file.read().url.clone();
+    if !url.is_empty() {
+        if let Ok(metadata) = gyroflow_core::util::get_video_metadata(&url) {
+            return metadata.rotation as f64;
+        }
+    }
+    let video_rotation = stab.params.read().video_rotation;
+    if crate::orientation::is_quarter_turn(video_rotation) || (normalize_angle(video_rotation) - 180.0).abs() < 1.0 {
+        video_rotation
+    } else {
+        0.0
+    }
+}
+
+fn normalize_angle(rotation: f64) -> f64 {
+    if !rotation.is_finite() { 0.0 } else { rotation.rem_euclid(360.0) }
+}
+
 struct PerFrameParams { }
 
 impl Execute for GyroflowPlugin {
@@ -530,6 +657,12 @@ impl Execute for GyroflowPlugin {
 
                 let time = in_args.get_time()?;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
+
+                // The official plugin loads the clip Resolve already has open.
+                // This build used to wait for Browse, so the sliders stayed disabled.
+                instance_data.adopt_host_source_file(effect.properties().ok().and_then(|props: EffectInstance| {
+                    props.get_src_file_path().ok()
+                }));
 
                 let loading_pending_video_file = instance_data.check_pending_file_info()?;
 
@@ -547,7 +680,7 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
-                let org_ratio = params.size.0 as f64 / params.size.1 as f64;
+                let video_size = params.size;
                 let (has_accurate_timestamps, has_offsets) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
@@ -611,17 +744,27 @@ impl Execute for GyroflowPlugin {
                 let src_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize, src_stride);
                 let out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize, out_stride);
 
-                let src_rect = InstanceData::get_center_rect(src_size.0, src_size.1, org_ratio);
+                let dont_draw_outside = instance_data.param_dont_draw_outside.get_value_at_time(time)?;
+                let slider = instance_data.param_input_rotation.get_value_at_time(time).unwrap_or(0.0);
+                let host_turn = resolve_host_turn(
+                    instance_data.rotation_override(),
+                    instance_data.metadata_rotation,
+                    slider,
+                    video_size,
+                    (src_size.0, src_size.1),
+                    instance_data.resolve_page,
+                );
+                let geometry = frame_geometry(
+                    video_size,
+                    host_turn,
+                    (src_size.0, src_size.1),
+                    (out_size.0, out_size.1),
+                    instance_data.resolve_page,
+                    dont_draw_outside,
+                );
+                let src_rect = geometry.src_rect;
+                let mut out_rect = geometry.out_rect;
 
-                let mut out_rect = if instance_data.param_dont_draw_outside.get_value_at_time(time)? {
-                    let output_ratio = out_size.0 as f64 / out_size.1 as f64;
-                    let mut rect = InstanceData::get_center_rect(src_rect.2, src_rect.3, output_ratio);
-                    rect.0 += src_rect.0;
-                    rect.1 += src_rect.1;
-                    Some(rect)
-                } else {
-                    None
-                };
                 let out_scale = output_image.get_render_scale()?;
                 if (out_scale.x != 1.0 || out_scale.y != 1.0) && !in_args.get_opengl_enabled().unwrap_or_default() {
                     let w = (out_size.0 as f64 * out_scale.x as f64).round() as usize;
@@ -636,7 +779,9 @@ impl Execute for GyroflowPlugin {
                     }
                 }
 
-                let input_rotation = instance_data.param_input_rotation.get_value_at_time(time).ok().map(|x| x as f32);
+                // Kernel rotation undoes the host's pre-rotation. 0° is a no-op, same as
+                // leaving Input rotation at its default.
+                let input_rotation = Some(geometry.kernel_rotation as f32);
 
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
@@ -822,13 +967,23 @@ impl Execute for GyroflowPlugin {
                     param_dont_draw_outside:        param_set.parameter("DontDrawOutside")?,
                     param_include_project_data:     param_set.parameter("IncludeProjectData")?,
                     param_input_rotation:           param_set.parameter("InputRotation")?,
+                    param_rotation_override:        param_set.parameter("RotationOverride")?,
                     gyrodata:                       LruCache::new(std::num::NonZeroUsize::new(20).unwrap()),
                     original_output_size:           (0, 0),
                     original_video_size:            (0, 0),
+                    metadata_rotation:              0.0,
+                    metadata_rotation_known:        false,
+                    resolve_page:                   effect.properties()
+                        .and_then(|props: EffectInstance| props.get_resolve_page())
+                        .map(|page| HostPage::from_resolve_page(&page))
+                        .unwrap_or(HostPage::Other),
                     num_frames:                     0,
                     fps:                            0.0,
                     current_file_info:              Arc::new(Mutex::new(None)),
                     current_file_info_pending:      Arc::new(AtomicBool::new(false)),
+                    pending_src_path:               effect.properties().ok().and_then(|props: EffectInstance| {
+                        props.get_src_file_path().ok().filter(|path| !path.is_empty())
+                    }),
                     reload_values_from_project:     false,
                     ever_changed:                   false,
                     opencl_disabled:                false,
@@ -922,6 +1077,8 @@ impl Execute for GyroflowPlugin {
                     let instance_data = effect.get_instance_data::<InstanceData>()?;
                     if in_args.get_name()? == "gyrodata" || in_args.get_name()? == "ReloadProject" {
                         instance_data.reload_values_from_project = true;
+                        instance_data.metadata_rotation = 0.0;
+                        instance_data.metadata_rotation_known = false;
                     }
                     instance_data.clear_stab();
                 }
@@ -962,7 +1119,7 @@ impl Execute for GyroflowPlugin {
                     match in_args.get_name()?.as_ref() {
                         "FOV" | "Smoothness" | "LensCorrectionStrength" |
                         "HorizonLockAmount" | "HorizonLockRoll" |
-                        "PositionX" | "PositionY" | "Rotation" | "InputRotation" | "VideoSpeed" |
+                        "PositionX" | "PositionY" | "Rotation" | "InputRotation" | "RotationOverride" | "VideoSpeed" |
                         "UseGyroflowsKeyframes" | "RecalculateKeyframes" => {
                             let instance_data: &mut InstanceData = effect.get_instance_data()?;
                             instance_data.param_status.set_label("Calculating...")?;
@@ -1010,7 +1167,27 @@ impl Execute for GyroflowPlugin {
                 let instance_data = effect.get_instance_data::<InstanceData>()?;
                 let rod = instance_data.source_clip.get_region_of_definition(time)?;
                 let mut out_rod = rod;
-                if instance_data.original_output_size != (0, 0) && !instance_data.param_dont_draw_outside.get_value_at_time(time)? {
+                let video_size = instance_data.original_video_size;
+                let slider = instance_data.param_input_rotation.get_value_at_time(time).unwrap_or(0.0);
+                let host_turn = resolve_host_turn(
+                    instance_data.rotation_override(),
+                    instance_data.metadata_rotation,
+                    slider,
+                    video_size,
+                    ((rod.x2 - rod.x1).max(0.0) as usize, (rod.y2 - rod.y1).max(0.0) as usize),
+                    instance_data.resolve_page,
+                );
+                if let Some(size) = custom_output_region(video_size, host_turn.aspect, instance_data.resolve_page) {
+                    // Fusion and other hosts can take the portrait frame as their output,
+                    // instead of stretching it into the stored landscape size.
+                    out_rod.x1 = 0.0;
+                    out_rod.y1 = 0.0;
+                    out_rod.x2 = size.0 as f64;
+                    out_rod.y2 = size.1 as f64;
+                } else if host_turn.aspect.abs() > 0.5 && instance_data.resolve_page.fixes_timeline_output() {
+                    // Edit and Color already sized the clip to the timeline. Reporting the
+                    // project's unrotated size here is what stretched vertical frames.
+                } else if instance_data.original_output_size != (0, 0) && !instance_data.param_dont_draw_outside.get_value_at_time(time)? {
                     out_rod.x2 = instance_data.original_output_size.0 as f64;
                     out_rod.y2 = instance_data.original_output_size.1 as f64;
                 }
@@ -1162,6 +1339,14 @@ impl Execute for GyroflowPlugin {
                     let _ = param.set_script_name("PositionY");
                     param.set_parent("AdjustGroup")?;
 
+                    let mut param = param_set.param_define_choice("RotationOverride")?;
+                    param.set_label("Rotation Override")?;
+                    param.set_hint("Override the auto rotation for vertical content")?;
+                    param.set_default(0)?;
+                    param.set_choices(&["Auto", "Vertical Video"])?;
+                    let _ = param.set_script_name("RotationOverride");
+                    param.set_parent("AdjustGroup")?;
+
                     let mut param = param_set.param_define_double("InputRotation")?;
                     param.set_default(0.0)?;
                     param.set_display_min(-360.0)?;
@@ -1264,6 +1449,10 @@ impl Execute for GyroflowPlugin {
                 OK
             },
             Describe(ref mut effect) => {
+                // Before the OpenGL-only return below. That return used to skip
+                // log setup entirely, and on macOS the /tmp fallback never ran.
+                self.init_plugin_log();
+
 				self.host_supports_multiple_clip_depths = _plugin_context.get_host().get_supports_multiple_clip_depths()?;
 
                 let supports_opencl = _plugin_context.get_host().get_opencl_render_supported().unwrap_or_default() == "true";
@@ -1282,9 +1471,9 @@ impl Execute for GyroflowPlugin {
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
-                effect_properties.set_label("Gyroflow-old")?;
-                effect_properties.set_short_label("Gyroflow-old")?;
-                effect_properties.set_long_label("Gyroflow-old")?;
+                effect_properties.set_label("Gyroflow(Emre)")?;
+                effect_properties.set_short_label("Gyroflow(Emre)")?;
+                effect_properties.set_long_label("Gyroflow(Emre)")?;
 
                 effect_properties.set_supported_pixel_depths(&[BitDepth::Byte, BitDepth::Short, BitDepth::Float])?;
                 effect_properties.set_supported_contexts(&[ImageEffectContext::Filter])?;
@@ -1318,45 +1507,11 @@ impl Execute for GyroflowPlugin {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 if _has_vulkan || _has_dx12 { let _ = effect_properties.set_cuda_render_supported("true"); }
 
-				if !self.log_initialized {
-                    // win_dbg_logger::init();
-                    // log::set_max_level(log::LevelFilter::Debug);
-                    // self.log_initialized = true;
-
-                    let mut tmp_log = std::env::temp_dir();
-                    tmp_log.push("gyroflow-ofx.log");
-
-                    let log_path = if let Ok(path) = effect_properties.get_file_path() {
-                        std::path::Path::new(&path).with_extension("log")
-                    } else {
-                        tmp_log.clone()
-                    };
-                    let log_config = [ "mp4parse", "wgpu", "naga", "akaze", "ureq", "rustls", "ofx" ]
-                        .into_iter()
-                        .fold(simplelog::ConfigBuilder::new(), |mut cfg, x| { cfg.add_filter_ignore_str(x); cfg })
-                        .build();
-
-                    if let Ok(file_log) = std::fs::File::create(&log_path) {
-                        let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                        self.log_initialized = true;
-                    } else if let Ok(file_log) = std::fs::File::create(&tmp_log) {
-                        let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                        self.log_initialized = true;
-                    } else if cfg!(target_os = "linux") {
-                        if let Ok(file_log) = std::fs::File::create("/tmp/gyroflow-ofx.log") {
-                            let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                            self.log_initialized = true;
-                        } else {
-                            eprintln!("Failed to create log file: {log_path:?}, {tmp_log:?}, /tmp/gyroflow-ofx.log");
-                        }
-                    }
-                }
-
                 OK
             }
 
             Load => {
-                log_panics::init();
+                self.init_plugin_log();
                 OK
             },
 
