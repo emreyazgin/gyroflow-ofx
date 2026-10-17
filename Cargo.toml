@@ -41,7 +41,7 @@ use-opencl = ["gyroflow-core/use-opencl"]
 opt-level = 2
 
 [patch.crates-io]
-ofx = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "9f96aa7" }
-ofx_sys = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "9f96aa7" }
+ofx = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "0b15219" }
+ofx_sys = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "0b15219" }
 #ofx = { path = "../ofx-rs/ofx" }
 #ofx_sys = { path = "../ofx-rs/ofx-sys" }
