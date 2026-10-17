@@ -19,6 +19,47 @@ pub struct CurrentFileInfo {
     pub height: usize,
     pub pixel_aspect_ratio: String
 }
+/// A `.gyroflow` project sitting next to `file_path` (same name, or a name that
+/// starts with the clip and ends in `.gyroflow`). `None` when the clip should
+/// be opened directly.
+pub fn project_path_for_video(file_path: &str) -> Option<String> {
+    if file_path.is_empty() {
+        return None;
+    }
+    let mut project_path = std::path::Path::new(file_path).with_extension("gyroflow");
+    if !project_path.exists() {
+        if let Some(parent) = project_path.parent() {
+            if let Ok(paths) = std::fs::read_dir(parent) {
+                if let Some(fname) = project_path.with_extension("").file_name().map(|x| x.to_string_lossy().to_string()) {
+                    for path in paths.flatten() {
+                        let path_fname = path.file_name().to_string_lossy().to_string();
+                        if path_fname.starts_with(&fname) && path_fname.ends_with(".gyroflow") {
+                            project_path = path.path();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if project_path.exists() {
+        Some(project_path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// Project field to store when Resolve hands the effect its media path and the
+/// user has not chosen a file yet. A sibling project wins; otherwise the video
+/// itself is loaded, which is how the official plugin stabilizes GoPro, DJI,
+/// and Insta360 clips without a separate project.
+pub fn project_path_from_host_source(current_project: &str, src_file: &str) -> Option<String> {
+    if !current_project.is_empty() || src_file.is_empty() {
+        return None;
+    }
+    Some(project_path_for_video(src_file).unwrap_or_else(|| src_file.to_string()))
+}
+
 impl CurrentFileInfo {
     pub fn get_fuscript() -> Option<std::path::PathBuf> {
         if cfg!(target_os = "windows") {
@@ -54,25 +95,6 @@ impl CurrentFileInfo {
                     let resolution = lines[4].split("x").filter_map(|x| x.parse::<usize>().ok()).collect::<Vec<_>>();
                     let file_path = lines[5];
                     if fps > 0.0 && frame_count > 0 && duration_s > 0.0 && !file_path.is_empty() {
-                        let mut project_path = std::path::Path::new(file_path).with_extension("gyroflow");
-                        if !project_path.exists() {
-                            // Find first project path that begins with the file name
-                            if let Some(parent) = project_path.parent() {
-                                if let Ok(paths) = std::fs::read_dir(parent) {
-                                    if let Some(fname) = project_path.with_extension("").file_name().map(|x| x.to_string_lossy().to_string()) {
-                                        for path in paths {
-                                            if let Ok(path) = path {
-                                                let path_fname = path.file_name().to_string_lossy().to_string();
-                                                if path_fname.starts_with(&fname) && path_fname.ends_with(".gyroflow") {
-                                                    project_path = path.path();
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         let info = Self {
                             file_path: file_path.to_string(),
                             fps,
@@ -81,7 +103,7 @@ impl CurrentFileInfo {
                             width: *resolution.get(0).unwrap_or(&0),
                             height: *resolution.get(1).unwrap_or(&0),
                             pixel_aspect_ratio: par.to_string(),
-                            project_path: if project_path.exists() { Some(project_path.to_string_lossy().to_string()) } else { None }
+                            project_path: project_path_for_video(file_path)
                         };
                         log::debug!("{info:#?}");
                         *current_file_info.lock() = Some(info);
@@ -115,5 +137,52 @@ impl CurrentFileInfo {
         } else {
             0.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gyroflow-emre-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sibling_project_is_preferred_over_the_video() {
+        let dir = scratch_dir("sibling");
+        let video = dir.join("clip.mov");
+        let project = dir.join("clip_1.gyroflow");
+        std::fs::write(&video, b"v").unwrap();
+        std::fs::write(&project, b"p").unwrap();
+        let found = project_path_for_video(video.to_str().unwrap()).unwrap();
+        assert_eq!(found, project.to_string_lossy());
+        assert_eq!(
+            project_path_from_host_source("", video.to_str().unwrap()).as_deref(),
+            Some(found.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn video_without_a_project_is_opened_directly() {
+        let dir = scratch_dir("direct");
+        let video = dir.join("clip.mp4");
+        std::fs::write(&video, b"v").unwrap();
+        assert_eq!(project_path_for_video(video.to_str().unwrap()), None);
+        assert_eq!(
+            project_path_from_host_source("", video.to_str().unwrap()).as_deref(),
+            Some(video.to_str().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_project_is_left_alone() {
+        assert_eq!(project_path_from_host_source("/already/set.gyroflow", "/clip.mov"), None);
+        assert_eq!(project_path_from_host_source("", ""), None);
     }
 }

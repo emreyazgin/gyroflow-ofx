@@ -36,6 +36,44 @@ struct GyroflowPlugin {
     log_initialized: bool
 }
 
+impl GyroflowPlugin {
+    /// Log next to Gyroflow's other files, then the temp directory, then `/tmp`.
+    ///
+    /// The old path was beside the bundle binary (`…/MacOS/GyroflowEmre.log`).
+    /// `/Library/OFX/Plugins` is not writable, and the `/tmp` fallback was
+    /// compiled out on macOS, so a Mac install produced no log at all when
+    /// Describe returned early.
+    fn init_plugin_log(&mut self) {
+        if self.log_initialized {
+            return;
+        }
+        log_panics::init();
+        let log_config = [ "mp4parse", "wgpu", "naga", "akaze", "ureq", "rustls", "ofx" ]
+            .into_iter()
+            .fold(simplelog::ConfigBuilder::new(), |mut cfg, x| { cfg.add_filter_ignore_str(x); cfg })
+            .build();
+        let name = "gyroflow-emre-ofx.log";
+        let candidates = [
+            gyroflow_core::settings::data_dir().join(name),
+            std::env::temp_dir().join(name),
+            std::path::PathBuf::from("/tmp").join(name),
+        ];
+        for path in &candidates {
+            if let Ok(file_log) = std::fs::File::create(path) {
+                if simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config.clone(), file_log).is_ok() {
+                    self.log_initialized = true;
+                    log::info!("Log file: {}", path.display());
+                    return;
+                }
+            }
+        }
+        eprintln!(
+            "gyroflow-emre: failed to create a log file at {:?}, {:?}, or {:?}",
+            candidates[0], candidates[1], candidates[2]
+        );
+    }
+}
+
 struct KeyframableParams {
     fov: ParamHandle<Double>,
     smoothness: ParamHandle<Double>,
@@ -125,6 +163,9 @@ struct InstanceData {
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
+    /// Media path from Resolve's `OfxImageEffectPropSrcFilePath`, applied once
+    /// when the project field is still empty.
+    pending_src_path: Option<String>,
 
     opencl_disabled: bool,
 }
@@ -146,6 +187,7 @@ impl InstanceData {
         let _ = kparams.positiony.set_enabled(loaded);
         let _ = kparams.rotation.set_enabled(loaded);
         let _ = kparams.video_speed.set_enabled(loaded);
+        let _ = self.param_rotation_override.set_enabled(loaded);
         let _ = self.param_disable_stretch.set_enabled(loaded);
         let _ = self.param_toggle_overview.set_enabled(loaded);
         let _ = self.param_reload_project.set_enabled(loaded);
@@ -460,6 +502,27 @@ impl InstanceData {
         Ok(false)
     }
 
+    /// Fill an empty project field from the host media path. A saved or browsed
+    /// path is kept. A sibling `.gyroflow` is used when one exists.
+    fn adopt_host_source_file(&mut self, fresh_src: Option<String>) {
+        let current = self.param_project_path.get_value().unwrap_or_default();
+        if !current.is_empty() {
+            self.pending_src_path = None;
+            return;
+        }
+        if self.pending_src_path.as_deref().unwrap_or("").is_empty() {
+            if let Some(path) = fresh_src.filter(|path| !path.is_empty()) {
+                self.pending_src_path = Some(path);
+            }
+        }
+        let Some(src) = self.pending_src_path.clone() else { return };
+        let Some(path) = project_path_from_host_source(&current, &src) else { return };
+        self.reload_values_from_project = true;
+        if self.param_project_path.set_value(path).is_ok() {
+            self.pending_src_path = None;
+        }
+    }
+
     pub fn clear_stab(&mut self) {
         let local_keys = self.gyrodata.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
         self.gyrodata.clear();
@@ -594,6 +657,12 @@ impl Execute for GyroflowPlugin {
 
                 let time = in_args.get_time()?;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
+
+                // The official plugin loads the clip Resolve already has open.
+                // This build used to wait for Browse, so the sliders stayed disabled.
+                instance_data.adopt_host_source_file(effect.properties().ok().and_then(|props: EffectInstance| {
+                    props.get_src_file_path().ok()
+                }));
 
                 let loading_pending_video_file = instance_data.check_pending_file_info()?;
 
@@ -912,6 +981,9 @@ impl Execute for GyroflowPlugin {
                     fps:                            0.0,
                     current_file_info:              Arc::new(Mutex::new(None)),
                     current_file_info_pending:      Arc::new(AtomicBool::new(false)),
+                    pending_src_path:               effect.properties().ok().and_then(|props: EffectInstance| {
+                        props.get_src_file_path().ok().filter(|path| !path.is_empty())
+                    }),
                     reload_values_from_project:     false,
                     ever_changed:                   false,
                     opencl_disabled:                false,
@@ -1377,6 +1449,10 @@ impl Execute for GyroflowPlugin {
                 OK
             },
             Describe(ref mut effect) => {
+                // Before the OpenGL-only return below. That return used to skip
+                // log setup entirely, and on macOS the /tmp fallback never ran.
+                self.init_plugin_log();
+
 				self.host_supports_multiple_clip_depths = _plugin_context.get_host().get_supports_multiple_clip_depths()?;
 
                 let supports_opencl = _plugin_context.get_host().get_opencl_render_supported().unwrap_or_default() == "true";
@@ -1431,45 +1507,11 @@ impl Execute for GyroflowPlugin {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 if _has_vulkan || _has_dx12 { let _ = effect_properties.set_cuda_render_supported("true"); }
 
-				if !self.log_initialized {
-                    // win_dbg_logger::init();
-                    // log::set_max_level(log::LevelFilter::Debug);
-                    // self.log_initialized = true;
-
-                    let mut tmp_log = std::env::temp_dir();
-                    tmp_log.push("gyroflow-emre-ofx.log");
-
-                    let log_path = if let Ok(path) = effect_properties.get_file_path() {
-                        std::path::Path::new(&path).with_extension("log")
-                    } else {
-                        tmp_log.clone()
-                    };
-                    let log_config = [ "mp4parse", "wgpu", "naga", "akaze", "ureq", "rustls", "ofx" ]
-                        .into_iter()
-                        .fold(simplelog::ConfigBuilder::new(), |mut cfg, x| { cfg.add_filter_ignore_str(x); cfg })
-                        .build();
-
-                    if let Ok(file_log) = std::fs::File::create(&log_path) {
-                        let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                        self.log_initialized = true;
-                    } else if let Ok(file_log) = std::fs::File::create(&tmp_log) {
-                        let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                        self.log_initialized = true;
-                    } else if cfg!(target_os = "linux") {
-                        if let Ok(file_log) = std::fs::File::create("/tmp/gyroflow-emre-ofx.log") {
-                            let _ = simplelog::WriteLogger::init(log::LevelFilter::Debug, log_config, file_log);
-                            self.log_initialized = true;
-                        } else {
-                            eprintln!("Failed to create log file: {log_path:?}, {tmp_log:?}, /tmp/gyroflow-emre-ofx.log");
-                        }
-                    }
-                }
-
                 OK
             }
 
             Load => {
-                log_panics::init();
+                self.init_plugin_log();
                 OK
             },
 
