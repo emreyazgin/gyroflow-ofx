@@ -12,6 +12,7 @@ use crate::orientation::{
     custom_output_region, frame_geometry, resolve_host_turn, stabilization_output_size,
     HostPage, RotationOverride,
 };
+use crate::panel_view::{self, PanelGroups, PanelView};
 
 // Distinct from the official plugin ids (`xyz.gyroflow` and
 // `nl.smslv.gyroflowofx.fisheyestab_v1`) so this build can be installed beside them.
@@ -147,6 +148,11 @@ struct InstanceData {
     param_include_project_data: ParamHandle<Bool>,
     param_input_rotation: ParamHandle<Double>,
     param_rotation_override: ParamHandle<Int>,
+    param_zoom_limit: ParamHandle<Double>,
+    param_zoom_limit_override: ParamHandle<Bool>,
+    /// True while the plugin copies the project zoom limit onto the slider, so
+    /// that write is not stored as the user's override.
+    updating_zoom_display: bool,
     gyrodata: LruCache<String, Arc<StabilizationManager>>,
 
     reload_values_from_project: bool,
@@ -187,6 +193,7 @@ impl InstanceData {
         let _ = kparams.positiony.set_enabled(loaded);
         let _ = kparams.rotation.set_enabled(loaded);
         let _ = kparams.video_speed.set_enabled(loaded);
+        let _ = self.param_zoom_limit.set_enabled(loaded);
         let _ = self.param_rotation_override.set_enabled(loaded);
         let _ = self.param_disable_stretch.set_enabled(loaded);
         let _ = self.param_toggle_overview.set_enabled(loaded);
@@ -392,6 +399,13 @@ impl InstanceData {
                     kparams.horizon_lock_amount.set_value(if smooth.horizon_lock.lock_enabled { smooth.horizon_lock.horizonlockpercent } else { 0.0 })?;
                     kparams.horizon_lock_roll.set_value(if smooth.horizon_lock.lock_enabled { smooth.horizon_lock.horizonroll } else { 0.0 })?;
                     kparams.video_speed.set_value(params.video_speed * 100.0)?;
+                    // Show the file's zoom limit. Clear the override afterwards so a
+                    // host that reports this set_value as a user edit cannot pin it.
+                    self.updating_zoom_display = true;
+                    let zoom_set = self.param_zoom_limit.set_value(params.max_zoom.unwrap_or(130.0));
+                    self.updating_zoom_display = false;
+                    zoom_set?;
+                    self.param_zoom_limit_override.set_value(false)?;
                     kparams.positionx.set_value(params.adaptive_zoom_center_offset.0 * 100.0)?;
                     kparams.positiony.set_value(params.adaptive_zoom_center_offset.1 * 100.0)?;
                     kparams.rotation.set_value(params.video_rotation)?;
@@ -445,6 +459,24 @@ impl InstanceData {
                 params.framebuffer_inverted = true;
             }
 
+
+            // Zoom limit is not part of the keyframe provider. Writing it on every
+            // load would replace the limit stored in the project, so it is applied
+            // only after the user has moved the slider.
+            if let Some(zoom) = panel_view::applied_zoom_limit(
+                self.param_zoom_limit_override.get_value().unwrap_or(false),
+                self.param_zoom_limit.get_value().unwrap_or(130.0),
+            ) {
+                let iters = stab.params.read().max_zoom_iterations.max(1);
+                stab.set_max_zoom(zoom, iters);
+            } else if let Some(zoom) = stab.params.read().max_zoom {
+                let shown = self.param_zoom_limit.get_value().unwrap_or(130.0);
+                if (shown - zoom).abs() > 0.5 {
+                    self.updating_zoom_display = true;
+                    let _ = self.param_zoom_limit.set_value(zoom);
+                    self.updating_zoom_display = false;
+                }
+            }
 
             stab.init_size();
             let video_size = stab.params.read().size;
@@ -642,6 +674,31 @@ fn container_rotation(stab: &StabilizationManager) -> f64 {
 
 fn normalize_angle(rotation: f64) -> f64 {
     if !rotation.is_finite() { 0.0 } else { rotation.rem_euclid(360.0) }
+}
+
+/// Hide controls with `kOfxParamPropSecret` on the instance.
+///
+/// Resolve reads that flag when it builds the inspector and, on current
+/// versions, again when it changes during `InstanceChanged`. Parameters are
+/// described visible: a secret descriptor flag is permanent in Resolve.
+/// `LoadCurrent` exists only when Resolve scripting is available, so a missing
+/// name is skipped. Group headers are secret only when every child is hidden;
+/// hiding the header alone does not hide the children.
+fn apply_panel_visibility(param_set: &ParamSetHandle) -> Result<()> {
+    let view = PanelView::from_index(param_set.parameter::<Int>("View")?.get_value().unwrap_or(0));
+    let custom = PanelGroups {
+        project: param_set.parameter::<Bool>("ShowProject")?.get_value().unwrap_or(true),
+        stabilization: param_set.parameter::<Bool>("ShowStabilization")?.get_value().unwrap_or(true),
+        adjustments: param_set.parameter::<Bool>("ShowAdjustments")?.get_value().unwrap_or(true),
+        keyframes: param_set.parameter::<Bool>("ShowKeyframes")?.get_value().unwrap_or(true),
+        output: param_set.parameter::<Bool>("ShowOutput")?.get_value().unwrap_or(true),
+    };
+    for name in panel_view::VISIBILITY_PARAMS {
+        if let Ok(mut param) = param_set.parameter::<Bool>(name) {
+            param.set_secret(panel_view::parameter_is_secret(name, view, custom))?;
+        }
+    }
+    Ok(())
 }
 
 struct PerFrameParams { }
@@ -968,6 +1025,9 @@ impl Execute for GyroflowPlugin {
                     param_include_project_data:     param_set.parameter("IncludeProjectData")?,
                     param_input_rotation:           param_set.parameter("InputRotation")?,
                     param_rotation_override:        param_set.parameter("RotationOverride")?,
+                    param_zoom_limit:               param_set.parameter("ZoomLimit")?,
+                    param_zoom_limit_override:      param_set.parameter("ZoomLimitOverride")?,
+                    updating_zoom_display:          false,
                     gyrodata:                       LruCache::new(std::num::NonZeroUsize::new(20).unwrap()),
                     original_output_size:           (0, 0),
                     original_video_size:            (0, 0),
@@ -1008,6 +1068,9 @@ impl Execute for GyroflowPlugin {
                 }
 
                 effect.set_instance_data(instance_data)?;
+                // Secret is set on the instance, not the descriptor. Resolve will not
+                // show a parameter again if it was secret when described.
+                apply_panel_visibility(&param_set)?;
 
                 OK
             }
@@ -1115,11 +1178,19 @@ impl Execute for GyroflowPlugin {
                     let instance_data: &mut InstanceData = effect.get_instance_data()?;
                     CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone());
                 }
+                if matches!(in_args.get_name()?.as_ref(), "View" | "ShowProject" | "ShowStabilization" | "ShowAdjustments" | "ShowKeyframes" | "ShowOutput") {
+                    apply_panel_visibility(&effect.parameter_set()?)?;
+                }
                 if in_args.get_change_reason()? == Change::UserEdited {
-                    match in_args.get_name()?.as_ref() {
+                    let changed_param = in_args.get_name()?;
+                    // Copying the project zoom limit onto the slider must not rebuild stabilization.
+                    let zoom_display_update = changed_param == "ZoomLimit"
+                        && effect.get_instance_data::<InstanceData>()?.updating_zoom_display;
+                    if !zoom_display_update {
+                    match changed_param.as_ref() {
                         "FOV" | "Smoothness" | "LensCorrectionStrength" |
                         "HorizonLockAmount" | "HorizonLockRoll" |
-                        "PositionX" | "PositionY" | "Rotation" | "InputRotation" | "RotationOverride" | "VideoSpeed" |
+                        "PositionX" | "PositionY" | "Rotation" | "InputRotation" | "RotationOverride" | "VideoSpeed" | "ZoomLimit" |
                         "UseGyroflowsKeyframes" | "RecalculateKeyframes" => {
                             let instance_data: &mut InstanceData = effect.get_instance_data()?;
                             instance_data.param_status.set_label("Calculating...")?;
@@ -1129,10 +1200,20 @@ impl Execute for GyroflowPlugin {
                                 instance_data.clear_stab();
                             }
                             instance_data.keyframable_params.write().cache_keyframes(instance_data.num_frames, instance_data.fps.max(1.0));
+                            if changed_param == "ZoomLimit" {
+                                let _ = instance_data.param_zoom_limit_override.set_value(true);
+                            }
+                            let zoom_limit = instance_data.param_zoom_limit.get_value().unwrap_or(130.0);
                             for (_, v) in instance_data.gyrodata.iter_mut() {
                                 match in_args.get_name()?.as_ref() {
                                     "Smoothness" | "HorizonLockAmount" | "HorizonLockRoll" | "RecalculateKeyframes" => { v.recompute_smoothness(); v.recompute_adaptive_zoom(); },
                                     "LensCorrectionStrength" | "PositionX" | "PositionY" | "Rotation" => { v.recompute_adaptive_zoom(); },
+                                    "ZoomLimit" => {
+                                        let iters = v.params.read().max_zoom_iterations.max(1);
+                                        v.set_max_zoom(zoom_limit, iters);
+                                        v.recompute_smoothness();
+                                        v.recompute_adaptive_zoom();
+                                    },
                                     _ => { }
                                 }
                                 v.recompute_undistortion();
@@ -1146,6 +1227,7 @@ impl Execute for GyroflowPlugin {
                             }
                         },
                         _ => { }
+                    }
                     }
                 }
 
@@ -1215,6 +1297,33 @@ impl Execute for GyroflowPlugin {
                 let mut param_set = effect.parameter_set()?;
 
                 {
+                    let mut param = param_set.param_define_choice("View")?;
+                    param.set_label("View")?;
+                    param.set_hint("Full shows every control. Minimal shows the project loader, smoothness, horizon lock, zoom limit, and rotation. Custom chooses which groups stay visible.")?;
+                    param.set_default(0)?;
+                    param.set_choices(&["Full", "Minimal", "Custom"])?;
+                    let _ = param.set_script_name("View");
+
+                    param_set.param_define_group("VisibleGroups")?
+                             .set_label("Visible groups")?;
+
+                    for (name, label, hint) in [
+                        ("ShowProject", "Project", "Project file, browse, and the other load controls."),
+                        ("ShowStabilization", "Stabilization", "Smoothness, horizon lock, zoom limit, and rotation override."),
+                        ("ShowAdjustments", "Adjustments", "FOV, lens correction, horizon roll, position, rotations, speed, and stretch."),
+                        ("ShowKeyframes", "Keyframes", "Gyroflow keyframes and the recalculate control."),
+                        ("ShowOutput", "Output", "Stabilization overview, clip bounds, and embedded project data."),
+                    ] {
+                        let mut param = param_set.param_define_boolean(name)?;
+                        param.set_label(label)?;
+                        param.set_hint(hint)?;
+                        param.set_default(true)?;
+                        let _ = param.set_script_name(name);
+                        param.set_parent("VisibleGroups")?;
+                    }
+                }
+
+                {
                     param_set.param_define_group("ProjectGroup")?
                              .set_label("Gyroflow project")?;
 
@@ -1226,6 +1335,13 @@ impl Execute for GyroflowPlugin {
                         let _ = param.set_script_name(x);
                         param.set_secret(true)?;
                     }
+
+                    // Described secret on purpose: Resolve will not reveal a parameter
+                    // that was secret in the descriptor, and this flag is not a control.
+                    let mut param = param_set.param_define_boolean("ZoomLimitOverride")?;
+                    param.set_default(false)?;
+                    param.set_secret(true)?;
+                    param.set_parent("ProjectGroup")?;
 
                     if CurrentFileInfo::is_available() {
                         let mut param = param_set.param_define_button("LoadCurrent")?;
@@ -1312,6 +1428,15 @@ impl Execute for GyroflowPlugin {
                     param.set_label("Horizon lock")?;
                     param.set_hint("Horizon lock amount")?;
                     let _ = param.set_script_name("HorizonLockAmount");
+                    param.set_parent("AdjustGroup")?;
+
+                    let mut param = param_set.param_define_double("ZoomLimit")?;
+                    param.set_default(130.0)?;
+                    param.set_display_min(110.0)?;
+                    param.set_display_max(300.0)?;
+                    param.set_label("Zoom limit")?;
+                    param.set_hint("Maximum zoom, in percent, as in the Gyroflow app. The project file's zoom limit is used until you move this slider.")?;
+                    let _ = param.set_script_name("ZoomLimit");
                     param.set_parent("AdjustGroup")?;
 
                     let mut param = param_set.param_define_double("HorizonLockRoll")?;
@@ -1411,6 +1536,8 @@ impl Execute for GyroflowPlugin {
                 param_set
                     .param_define_page("Main")?
                     .set_children(&[
+                        "View",
+                        "VisibleGroups",
                         "ProjectGroup",
                         "AdjustGroup",
                         "KeyframesGroup",
